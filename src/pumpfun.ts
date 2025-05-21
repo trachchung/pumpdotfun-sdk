@@ -97,15 +97,75 @@ export class PumpFunSDK {
         slippageBasisPoints
       );
 
-      const buyTx = await this.getBuyInstructions(
-        creator.publicKey,
+      // Instead of calling getBuyInstructions which requires an existing bonding curve,
+      // we'll create the buy instruction manually since we know the token is being created
+
+      const bondingCurvePDA = this.getBondingCurvePDA(mint.publicKey);
+      
+      const associatedBondingCurve = await getAssociatedTokenAddress(
         mint.publicKey,
-        globalAccount.feeRecipient,
-        buyAmount,
-        buyAmountWithSlippage
+        bondingCurvePDA,
+        true
       );
 
-      newTx.add(buyTx);
+      const associatedUser = await getAssociatedTokenAddress(
+        mint.publicKey, 
+        creator.publicKey, 
+        false
+      );
+
+      // Get event authority PDA
+      const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("__event_authority")],
+        this.program.programId
+      );
+
+      // Get global account PDA
+      const [globalAccountPDA] = PublicKey.findProgramAddressSync(
+        [Buffer.from(GLOBAL_ACCOUNT_SEED)],
+        this.program.programId
+      );
+
+      // Get creator vault PDA
+      const [creatorVaultPda] = PublicKey.findProgramAddressSync(
+        [Buffer.from("creator-vault"), creator.publicKey.toBuffer()],
+        this.program.programId
+      );
+
+      // Create associated token account for user if needed
+      try {
+        await getAccount(this.connection, associatedUser, commitment);
+      } catch (e) {
+        newTx.add(
+          createAssociatedTokenAccountInstruction(
+            creator.publicKey,
+            associatedUser,
+            creator.publicKey,
+            mint.publicKey
+          )
+        );
+      }
+
+      // Add the buy instruction
+      newTx.add(
+        await this.program.methods
+          .buy(new BN(buyAmount.toString()), new BN(buyAmountWithSlippage.toString()))
+          .accounts({
+            global: globalAccountPDA,
+            fee_recipient: globalAccount.feeRecipient,
+            mint: mint.publicKey,
+            bonding_curve: bondingCurvePDA,
+            associated_bonding_curve: associatedBondingCurve,
+            associated_user: associatedUser,
+            user: creator.publicKey,
+            system_program: new PublicKey(SYSTEM_PROGRAM_ID),
+            token_program: new PublicKey(TOKEN_PROGRAM_ID),
+            creator_vault: creatorVaultPda,
+            event_authority: eventAuthorityPda,
+            program: this.program.programId
+          } as any)
+          .transaction()
+      );
     }
 
     let createResults = await sendTx(
@@ -282,14 +342,14 @@ export class PumpFunSDK {
       globalAccount.feeBasisPoints
     );
     
-    // Calculate with more aggressive slippage by directly decreasing the value
-    // Reduce by expected calculation gap (from logs) plus 1 for safety
-    let sellAmountWithSlippage: bigint;
-    if (minSolOutput > 2n) {
-      // Apply a direct reduction to ensure we get below the expected value
-      sellAmountWithSlippage = minSolOutput - 2n;
-    } else {
-      // For very small amounts, use a minimum of 1
+    // Calculate with percentage-based slippage rather than a fixed value reduction
+    let sellAmountWithSlippage = calculateWithSlippageSell(
+      minSolOutput,
+      slippageBasisPoints
+    );
+    
+    // Make sure we don't go below 1 for very small amounts
+    if (sellAmountWithSlippage < 1n) {
       sellAmountWithSlippage = 1n;
     }
     
@@ -568,14 +628,14 @@ export class PumpFunSDK {
       globalAccount.feeBasisPoints
     );
     
-    // Calculate with more aggressive slippage by directly decreasing the value
-    // Reduce by expected calculation gap (from logs) plus 1 for safety
-    let sellAmountWithSlippage: bigint;
-    if (minSolOutput > 2n) {
-      // Apply a direct reduction to ensure we get below the expected value
-      sellAmountWithSlippage = minSolOutput - 2n;
-    } else {
-      // For very small amounts, use a minimum of 1
+    // Calculate with percentage-based slippage rather than a fixed value reduction
+    let sellAmountWithSlippage = calculateWithSlippageSell(
+      minSolOutput,
+      slippageBasisPoints
+    );
+    
+    // Make sure we don't go below 1 for very small amounts
+    if (sellAmountWithSlippage < 1n) {
       sellAmountWithSlippage = 1n;
     }
 
