@@ -41,15 +41,13 @@ import {
   sendTx,
 } from "./util.js";
 import { PumpFun, IDL } from "./IDL/index.js";
+import { Idl } from "@coral-xyz/anchor";
 
 // SDK Constants
-const PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const MPL_TOKEN_METADATA_PROGRAM_ID = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 const SYSTEM_PROGRAM_ID = "11111111111111111111111111111111";
 const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ASSOCIATED_TOKEN_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-const EVENT_AUTHORITY_ID = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1";
-const SYSVAR_RENT_ID = "SysvarRent111111111111111111111111111111111";
 
 export const GLOBAL_ACCOUNT_SEED = "global";
 export const MINT_AUTHORITY_SEED = "mint-authority";
@@ -60,10 +58,10 @@ export const EVENT_AUTHORITY_SEED = "__event_authority";
 export const DEFAULT_DECIMALS = 6;
 
 export class PumpFunSDK {
-  public program: Program<PumpFun>;
+  public program: Program<Idl>;
   public connection: Connection;
   constructor(provider?: Provider) {
-    this.program = new Program<PumpFun>(IDL as PumpFun, provider);
+    this.program = new Program(IDL as Idl, provider);
     this.connection = this.program.provider.connection;
   }
 
@@ -108,63 +106,52 @@ export class PumpFunSDK {
         true
       );
 
-      const associatedUser = await getAssociatedTokenAddress(
-        mint.publicKey, 
-        creator.publicKey, 
-        false
+      // Create associated token account for user if needed
+      const associatedUser = await this.createAssociatedTokenAccountIfNeeded(
+        creator.publicKey,
+        creator.publicKey,
+        mint.publicKey,
+        newTx,
+        commitment
       );
 
       // Get event authority PDA
-      const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("__event_authority")],
-        this.program.programId
-      );
+      const eventAuthorityPda = this.getEventAuthorityPda();
 
       // Get global account PDA
-      const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-        [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-        this.program.programId
-      );
+      const globalAccountPDA = this.getGlobalAccountPda();
 
-      // Get creator vault PDA
-      const [creatorVaultPda] = PublicKey.findProgramAddressSync(
-        [Buffer.from("creator-vault"), creator.publicKey.toBuffer()],
-        this.program.programId
-      );
+      // Derive creator_vault PDA using the creator's public key (for createAndBuy, bonding curve doesn't exist yet)
+      const creatorVaultPda = this.getCreatorVaultPda(creator.publicKey);
 
-      // Create associated token account for user if needed
-      try {
-        await getAccount(this.connection, associatedUser, commitment);
-      } catch (e) {
-        newTx.add(
-          createAssociatedTokenAccountInstruction(
-            creator.publicKey,
-            associatedUser,
-            creator.publicKey,
-            mint.publicKey
-          )
-        );
-      }
-
-      // Add the buy instruction
+      // Create buy instruction using Anchor coder
+      const buyInstructionData = this.program.coder.instruction.encode("buy", {
+        amount: new BN(buyAmount.toString()),
+        maxSolCost: new BN(buyAmountWithSlippage.toString())
+      });
+      
+      // Create accounts array in the exact order
+      const accounts = [
+        { pubkey: globalAccountPDA, isSigner: false, isWritable: false },
+        { pubkey: globalAccount.feeRecipient, isSigner: false, isWritable: true },
+        { pubkey: mint.publicKey, isSigner: false, isWritable: false },
+        { pubkey: bondingCurvePDA, isSigner: false, isWritable: true },
+        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+        { pubkey: associatedUser, isSigner: false, isWritable: true },
+        { pubkey: creator.publicKey, isSigner: true, isWritable: true },
+        { pubkey: new PublicKey(SYSTEM_PROGRAM_ID), isSigner: false, isWritable: false },
+        { pubkey: new PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false },
+        { pubkey: creatorVaultPda, isSigner: false, isWritable: true },
+        { pubkey: eventAuthorityPda, isSigner: false, isWritable: false },
+        { pubkey: this.program.programId, isSigner: false, isWritable: false }
+      ];
+      
       newTx.add(
-        await this.program.methods
-          .buy(new BN(buyAmount.toString()), new BN(buyAmountWithSlippage.toString()))
-          .accounts({
-            global: globalAccountPDA,
-            fee_recipient: globalAccount.feeRecipient,
-            mint: mint.publicKey,
-            bonding_curve: bondingCurvePDA,
-            associated_bonding_curve: associatedBondingCurve,
-            associated_user: associatedUser,
-            user: creator.publicKey,
-            system_program: new PublicKey(SYSTEM_PROGRAM_ID),
-            token_program: new PublicKey(TOKEN_PROGRAM_ID),
-            creator_vault: creatorVaultPda,
-            event_authority: eventAuthorityPda,
-            program: this.program.programId
-          } as any)
-          .transaction()
+        new TransactionInstruction({
+          keys: accounts,
+          programId: this.program.programId,
+          data: buyInstructionData
+        })
       );
     }
 
@@ -197,10 +184,7 @@ export class PumpFunSDK {
     }
     
     // Get global account
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      this.program.programId
-    );
+    const globalAccountPDA = this.getGlobalAccountPda();
     const globalAccount = await this.getGlobalAccount(commitment);
     
     // Calculate buy amount
@@ -216,64 +200,33 @@ export class PumpFunSDK {
       bondingCurvePDA,
       true
     );
-    const associatedUser = await getAssociatedTokenAddress(
-      mint,
-      buyer.publicKey,
-      false
-    );
     
-    // Get bonding curve account info to extract creator 
-    const bondingAccountInfo = await this.connection.getAccountInfo(bondingCurvePDA, commitment);
-    if (!bondingAccountInfo) {
-      throw new Error(`Bonding account info not found: ${bondingCurvePDA.toBase58()}`);
-    }
-
-    // Creator is at offset 49 (after 8 bytes discriminator, 5 BNs of 8 bytes each, and 1 byte boolean)
-    const creatorBytes = bondingAccountInfo.data.slice(49, 49 + 32);
-    const creator = new PublicKey(creatorBytes);
-    console.log("Creator from bonding curve:", creator.toString());
-
-    // Get the creator vault PDA
-    const [creatorVaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator-vault"), creator.toBuffer()],
-      this.program.programId
-    );
-    console.log("Creator vault PDA:", creatorVaultPda.toString());
+    // Get bonding curve creator using helper function
+    const bondingCurveCreator = await this.getBondingCurveCreator(bondingCurvePDA, commitment);
+    
+    // Derive creator_vault PDA using bonding curve creator (not user public key)
+    const creatorVaultPda = this.getCreatorVaultPda(bondingCurveCreator);
 
     // Get event authority PDA
-    const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("__event_authority")],
-      this.program.programId
-    );
+    const eventAuthorityPda = this.getEventAuthorityPda();
     
     // Create a new transaction
     let transaction = new Transaction();
     
     // Add token account creation instruction if needed
-    try {
-      await getAccount(this.connection, associatedUser, commitment);
-    } catch (e) {
-      transaction.add(
-        createAssociatedTokenAccountInstruction(
-          buyer.publicKey,
-          associatedUser,
-          buyer.publicKey,
-          mint
-        )
-      );
-    }
+    const associatedUser = await this.createAssociatedTokenAccountIfNeeded(
+      buyer.publicKey,
+      buyer.publicKey,
+      mint,
+      transaction,
+      commitment
+    );
     
-    // Create buy instruction data
-    const discriminator = [102, 6, 61, 18, 1, 218, 235, 234]; // buy instruction discriminator
-    const amountData = Buffer.alloc(8);
-    amountData.writeBigUInt64LE(BigInt(buyAmount.toString()), 0);
-    const slippageData = Buffer.alloc(8);
-    slippageData.writeBigUInt64LE(BigInt(buyAmountWithSlippage.toString()), 0);
-    const instructionData = Buffer.from([
-      ...discriminator,
-      ...Array.from(amountData),
-      ...Array.from(slippageData)
-    ]);
+    // Create buy instruction using Anchor coder
+    const buyInstructionData = this.program.coder.instruction.encode("buy", {
+      amount: new BN(buyAmount.toString()),
+      maxSolCost: new BN(buyAmountWithSlippage.toString())
+    });
     
     // Create accounts array in the exact order from buy_token_fixed.ts
     const accounts = [
@@ -296,7 +249,7 @@ export class PumpFunSDK {
       new TransactionInstruction({
         keys: accounts,
         programId: this.program.programId,
-        data: instructionData
+        data: buyInstructionData
       })
     );
     
@@ -329,10 +282,7 @@ export class PumpFunSDK {
     }
     
     // Get global account
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      this.program.programId
-    );
+    const globalAccountPDA = this.getGlobalAccountPda();
     const globalAccount = await this.getGlobalAccount(commitment);
     
     // Calculate sell amount and slippage
@@ -368,35 +318,25 @@ export class PumpFunSDK {
       false
     );
     
-    // Get bonding curve account info to extract creator 
-    const bondingAccountInfo = await this.connection.getAccountInfo(bondingCurvePDA, commitment);
-    if (!bondingAccountInfo) {
-      throw new Error(`Bonding account info not found: ${bondingCurvePDA.toBase58()}`);
-    }
-
-    // Creator is at offset 49 (after 8 bytes discriminator, 5 u64 fields at 8 bytes each, 1 byte boolean)
-    const creatorBytes = bondingAccountInfo.data.slice(49, 49 + 32);
-    const creator = new PublicKey(creatorBytes);
-    console.log("Creator from bonding curve:", creator.toString());
-
+    // Get bonding curve creator using helper function
+    const bondingCurveCreator = await this.getBondingCurveCreator(bondingCurvePDA, commitment);
+    
     // Get the creator vault PDA
-    const [creatorVaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator-vault"), creator.toBuffer()],
-      this.program.programId
-    );
+    const creatorVaultPda = this.getCreatorVaultPda(bondingCurveCreator);
     console.log("Creator vault PDA:", creatorVaultPda.toString());
 
     // Get event authority PDA
-    const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from(EVENT_AUTHORITY_SEED)],
-      this.program.programId
-    );
+    const eventAuthorityPda = this.getEventAuthorityPda();
     
     // Create a new transaction
     let transaction = new Transaction();
     
-    // Create accounts array in the exact same order as specified in the official IDL
-    const accounts = [
+    const sellInstructionData = this.program.coder.instruction.encode("sell", {
+      amount: new BN(sellTokenAmount.toString()),
+      minSolOutput: new BN(sellAmountWithSlippage.toString())
+    });
+    
+    const sellAccounts = [
       { pubkey: globalAccountPDA, isSigner: false, isWritable: false },
       { pubkey: globalAccount.feeRecipient, isSigner: false, isWritable: true },
       { pubkey: mint, isSigner: false, isWritable: false },
@@ -411,27 +351,11 @@ export class PumpFunSDK {
       { pubkey: this.program.programId, isSigner: false, isWritable: false }
     ];
     
-    // Create sell instruction using IDL
-    let ix = await this.program.methods
-      .sell(
-        new BN(sellTokenAmount.toString()),
-        new BN(sellAmountWithSlippage.toString())
-      )
-      .accounts({
-        global: globalAccountPDA,
-        feeRecipient: globalAccount.feeRecipient,
-        mint: mint,
-        bondingCurve: bondingCurvePDA,
-        associatedBondingCurve: associatedBondingCurve,
-        associatedUser: associatedUser,
-        user: sellerPublicKey,
-        systemProgram: new PublicKey(SYSTEM_PROGRAM_ID),
-        creatorVault: creatorVaultPda,
-        tokenProgram: new PublicKey(TOKEN_PROGRAM_ID),
-        eventAuthority: eventAuthorityPda,
-        program: this.program.programId
-      } as any)
-      .instruction();
+    let ix = new TransactionInstruction({
+      keys: sellAccounts,
+      programId: this.program.programId,
+      data: sellInstructionData
+    });
     
     transaction.add(ix);
     
@@ -466,22 +390,58 @@ export class PumpFunSDK {
       mplTokenMetadata
     );
 
+    const bondingCurvePDA = this.getBondingCurvePDA(mint.publicKey);
+
     const associatedBondingCurve = await getAssociatedTokenAddress(
       mint.publicKey,
-      this.getBondingCurvePDA(mint.publicKey),
+      bondingCurvePDA,
       true
     );
 
-    return this.program.methods
-      .create(name, symbol, uri, creator)
-      .accounts({
-        mint: mint.publicKey,
-        associatedBondingCurve: associatedBondingCurve,
-        metadata: metadataPDA,
-        user: creator,
-      } as any)
-      .signers([mint])
-      .transaction();
+    // Get mint authority PDA
+    const [mintAuthorityPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from(MINT_AUTHORITY_SEED)],
+      this.program.programId
+    );
+
+    // Get global account PDA
+    const globalAccountPDA = this.getGlobalAccountPda();
+
+    // Get event authority PDA
+    const eventAuthorityPda = this.getEventAuthorityPda();
+
+    // Create instruction manually to avoid typing issues
+    const createInstructionData = this.program.coder.instruction.encode("create", {
+      name: name,
+      symbol: symbol,
+      uri: uri,
+      creator: creator
+    });
+    
+    const createAccounts = [
+      { pubkey: mint.publicKey, isSigner: true, isWritable: true },                    // mint
+      { pubkey: mintAuthorityPDA, isSigner: false, isWritable: false },               // mint_authority
+      { pubkey: bondingCurvePDA, isSigner: false, isWritable: true },                 // bonding_curve
+      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },          // associated_bonding_curve
+      { pubkey: globalAccountPDA, isSigner: false, isWritable: false },               // global
+      { pubkey: mplTokenMetadata, isSigner: false, isWritable: false },               // mpl_token_metadata
+      { pubkey: metadataPDA, isSigner: false, isWritable: true },                     // metadata
+      { pubkey: creator, isSigner: true, isWritable: true },                          // user
+      { pubkey: new PublicKey(SYSTEM_PROGRAM_ID), isSigner: false, isWritable: false }, // system_program
+      { pubkey: new PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false }, // token_program
+      { pubkey: new PublicKey(ASSOCIATED_TOKEN_PROGRAM_ID), isSigner: false, isWritable: false }, // associated_token_program
+      { pubkey: new PublicKey("SysvarRent111111111111111111111111111111111"), isSigner: false, isWritable: false }, // rent
+      { pubkey: eventAuthorityPda, isSigner: false, isWritable: false },              // event_authority
+      { pubkey: this.program.programId, isSigner: false, isWritable: false }          // program
+    ];
+    
+    const createInstruction = new TransactionInstruction({
+      keys: createAccounts,
+      programId: this.program.programId,
+      data: createInstructionData
+    });
+    
+    return new Transaction().add(createInstruction);
   }
 
   async getBuyInstructionsBySolAmount(
@@ -535,29 +495,20 @@ export class PumpFunSDK {
 
     const associatedUser = await getAssociatedTokenAddress(mint, buyer, false);
 
-    // Get bonding curve account info to extract the creator
-    const bondingAccountInfo = await this.connection.getAccountInfo(bondingCurvePDA, commitment);
-    if (!bondingAccountInfo) {
-      throw new Error(`Bonding account info not found: ${bondingCurvePDA.toBase58()}`);
+    // Get bonding curve account to extract creator
+    const bondingCurveAccountInfo2 = await this.connection.getAccountInfo(bondingCurvePDA);
+    if (!bondingCurveAccountInfo2) {
+      throw new Error("Bonding curve account not found");
     }
+    
+    // Get bonding curve creator using helper function
+    const bondingCurveCreator = await this.getBondingCurveCreator(bondingCurvePDA, commitment);
 
-    // Creator is at offset 49 (after 8 bytes discriminator, 5 BNs of 8 bytes each, and 1 byte boolean)
-    const creatorBytes = bondingAccountInfo.data.slice(49, 49 + 32);
-    const creator = new PublicKey(creatorBytes);
-    console.log("Creator from bonding curve:", creator.toString());
-
-    // Get the creator vault PDA
-    const [creatorVaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator-vault"), creator.toBuffer()],
-      this.program.programId
-    );
-    console.log("Creator vault PDA:", creatorVaultPda.toString());
+    // Derive creator_vault PDA using bonding curve creator (not user public key)
+    const creatorVaultPda = this.getCreatorVaultPda(bondingCurveCreator);
 
     // Get event authority PDA
-    const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("__event_authority")],
-      this.program.programId
-    );
+    const eventAuthorityPda = this.getEventAuthorityPda();
 
     let transaction = new Transaction();
 
@@ -575,30 +526,35 @@ export class PumpFunSDK {
     }
 
     // Get global account PDA
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      this.program.programId
-    );
+    const globalAccountPDA = this.getGlobalAccountPda();
 
-    // Build and add the buy instruction with the correct accounts
+    // Create buy instruction using Anchor coder
+    const buyInstructionData = this.program.coder.instruction.encode("buy", {
+      amount: new BN(amount.toString()),
+      maxSolCost: new BN(solAmount.toString())
+    });
+    
+    const buyAccounts = [
+      { pubkey: globalAccountPDA, isSigner: false, isWritable: false },
+      { pubkey: feeRecipient, isSigner: false, isWritable: true },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: bondingCurvePDA, isSigner: false, isWritable: true },
+      { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+      { pubkey: associatedUser, isSigner: false, isWritable: true },
+      { pubkey: buyer, isSigner: true, isWritable: true },
+      { pubkey: new PublicKey(SYSTEM_PROGRAM_ID), isSigner: false, isWritable: false },
+      { pubkey: new PublicKey(TOKEN_PROGRAM_ID), isSigner: false, isWritable: false },
+      { pubkey: creatorVaultPda, isSigner: false, isWritable: true },
+      { pubkey: eventAuthorityPda, isSigner: false, isWritable: false },
+      { pubkey: this.program.programId, isSigner: false, isWritable: false }
+    ];
+    
     transaction.add(
-      await this.program.methods
-        .buy(new BN(amount.toString()), new BN(solAmount.toString()))
-        .accounts({
-          global: globalAccountPDA,
-          fee_recipient: feeRecipient,
-          mint: mint,
-          bonding_curve: bondingCurvePDA,
-          associated_bonding_curve: associatedBondingCurve,
-          associated_user: associatedUser,
-          user: buyer,
-          system_program: new PublicKey(SYSTEM_PROGRAM_ID),
-          token_program: new PublicKey(TOKEN_PROGRAM_ID),
-          creator_vault: creatorVaultPda,
-          event_authority: eventAuthorityPda,
-          program: this.program.programId
-        } as any)
-        .transaction()
+      new TransactionInstruction({
+        keys: buyAccounts,
+        programId: this.program.programId,
+        data: buyInstructionData
+      })
     );
 
     return transaction;
@@ -655,7 +611,8 @@ export class PumpFunSDK {
     mint: PublicKey,
     feeRecipient: PublicKey,
     amount: bigint,
-    minSolOutput: bigint
+    minSolOutput: bigint,
+    commitment: Commitment = DEFAULT_COMMITMENT
   ) {
     const bondingCurvePDA = this.getBondingCurvePDA(mint);
     
@@ -670,34 +627,15 @@ export class PumpFunSDK {
     let transaction = new Transaction();
 
     // Get global account PDA
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      this.program.programId
-    );
+    const globalAccountPDA = this.getGlobalAccountPda();
 
-    // Get bonding curve account info to extract the creator
-    const bondingAccountInfo = await this.connection.getAccountInfo(bondingCurvePDA);
-    if (!bondingAccountInfo) {
-      throw new Error(`Bonding account info not found: ${bondingCurvePDA.toBase58()}`);
-    }
-
-    // Creator is at offset 49 (after 8 bytes discriminator, 5 u64 fields, and 1 byte boolean)
-    const creatorBytes = bondingAccountInfo.data.slice(49, 49 + 32);
-    const creator = new PublicKey(creatorBytes);
-    console.log("Creator from bonding curve:", creator.toString());
-
-    // Create the creator vault PDA using the creator pubkey
-    const [creatorVaultPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from("creator-vault"), creator.toBuffer()],
-      this.program.programId
-    );
-    console.log("Creator vault PDA:", creatorVaultPda.toString());
+    const bondingCurveCreator = await this.getBondingCurveCreator(bondingCurvePDA, commitment);
+    
+    // Derive creator_vault PDA using bonding curve creator
+    const creatorVaultPda = this.getCreatorVaultPda(bondingCurveCreator);
 
     // Get event authority PDA
-    const [eventAuthorityPda] = PublicKey.findProgramAddressSync(
-      [Buffer.from(EVENT_AUTHORITY_SEED)],
-      this.program.programId
-    );
+    const eventAuthorityPda = this.getEventAuthorityPda();
 
     // Check IDL for the correct order of accounts
     const accounts = [
@@ -749,10 +687,7 @@ export class PumpFunSDK {
   }
 
   async getGlobalAccount(commitment: Commitment = DEFAULT_COMMITMENT) {
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      new PublicKey(PROGRAM_ID)
-    );
+    const globalAccountPDA = this.getGlobalAccountPda();
 
     const tokenAccount = await this.connection.getAccountInfo(
       globalAccountPDA,
@@ -767,6 +702,20 @@ export class PumpFunSDK {
       [Buffer.from(BONDING_CURVE_SEED), mint.toBuffer()],
       this.program.programId
     )[0];
+  }
+
+  private async getBondingCurveCreator(
+    bondingCurvePDA: PublicKey,
+    commitment: Commitment = DEFAULT_COMMITMENT
+  ): Promise<PublicKey> {
+    const bondingAccountInfo = await this.connection.getAccountInfo(bondingCurvePDA, commitment);
+    if (!bondingAccountInfo) {
+      throw new Error("Bonding curve account not found");
+    }
+
+    // Creator is at offset 49 (after 8 bytes discriminator, 5 u64 fields, and 1 byte boolean)
+    const creatorBytes = bondingAccountInfo.data.subarray(49, 49 + 32);
+    return new PublicKey(creatorBytes);
   }
 
   async createTokenMetadata(create: CreateTokenMetadata) {
@@ -819,7 +768,54 @@ export class PumpFunSDK {
         console.error('Error in createTokenMetadata:', error);
         throw error;
     }
-}
+  }
+
+
+  private getCreatorVaultPda(creator: PublicKey): PublicKey {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("creator-vault"), creator.toBuffer()],
+      this.program.programId
+    )[0];
+  }
+
+  private getGlobalAccountPda(): PublicKey {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
+      this.program.programId
+    )[0];
+  }
+
+  private getEventAuthorityPda(): PublicKey {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from(EVENT_AUTHORITY_SEED)],
+      this.program.programId
+    )[0];
+  }
+
+  private async createAssociatedTokenAccountIfNeeded(
+    payer: PublicKey,
+    owner: PublicKey,
+    mint: PublicKey,
+    transaction: Transaction,
+    commitment: Commitment = DEFAULT_COMMITMENT
+  ): Promise<PublicKey> {
+    const associatedTokenAccount = await getAssociatedTokenAddress(mint, owner, false);
+    
+    try {
+      await getAccount(this.connection, associatedTokenAccount, commitment);
+    } catch (e) {
+      transaction.add(
+        createAssociatedTokenAccountInstruction(
+          payer,
+          associatedTokenAccount,
+          owner,
+          mint
+        )
+      );
+    }
+    
+    return associatedTokenAccount;
+  }
   //EVENTS
   addEventListener<T extends PumpFunEventType>(
     eventType: T,
@@ -876,4 +872,5 @@ export class PumpFunSDK {
   removeEventListener(eventId: number) {
     this.program.removeEventListener(eventId);
   }
+
 }
