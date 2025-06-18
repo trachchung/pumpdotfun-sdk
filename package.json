@@ -1,7 +1,7 @@
 {
-  "name": "pumpdotfun-sdk",
+  "name": "pumpdotfun-sdk-for-trachchung",
   "version": "1.5.2",
-  "description": "A simple SDK for interacting with pumpdotfun",
+  "description": "A simple SDK for interacting with pumpdotfun for trachchung",
   "type": "module",
   "module": "./dist/esm/index.mjs",
   "main": "./dist/cjs/index.cjs",
@@ -30,7 +30,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/rckprtr/pumpdotfun-sdk.git"
+    "url": "https://github.com/trachchung/pumpdotfun-sdk.git"
   },
   "keywords": [
     "pumpdotfun",
